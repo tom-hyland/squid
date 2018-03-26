@@ -62,7 +62,7 @@
 #define SEND4(X,Y,Z,W) {debug("sending '" X "' to squid\n",Y,Z,W); printf(X "\n",Y,Z,W);}
 #endif
 
-const char *authenticate_ntlm_domain = "WORKGROUP";
+const char *authenticate_ntlm_domain = "";
 int strip_domain_enabled = 0;
 int NTLM_packet_debug_enabled = 0;
 
@@ -175,9 +175,13 @@ main(int argc, char *argv[])
             } else {
                 ntlm_make_challenge(&chal, authenticate_ntlm_domain, NULL, nonce, NTLM_NONCE_LEN, NTLM_NEGOTIATE_ASCII);
             }
-            // TODO: find out what this context means, and why only the fake auth helper contains it.
-            chal.context_high = htole32(0x003a<<16);
-
+            
+            // tweak payload, offset and length to get it working:
+            chal.payload[4] = 0x3a;
+            chal.target.offset = 48;
+            chal.target.len = 10;
+            chal.target.maxlen = 18; 
+            
             len = sizeof(chal) - sizeof(chal.payload) + le16toh(chal.target.maxlen);
             data = (char *) base64_encode_bin((char *) &chal, len);
             if (NTLM_packet_debug_enabled) {
