@@ -2863,7 +2863,7 @@ SQUID_DEFAULT_INCLUDES
 #endif
 )
 
-dnl *BSD dont include the dependencies for all their net/ and netinet/ files
+dnl *BSD do not include the dependencies for all their net/ and netinet/ files
 dnl We must include a few basic type headers for them to work.
 AC_CHECK_HEADERS( \
   net/if.h \
@@ -2988,6 +2988,13 @@ AC_CHECK_TYPE(mtyp_t,AC_DEFINE(HAVE_MTYP_T,1,
    [mtyp_t is defined by the system headers]),,[#include <sys/types.h>
 #include <sys/ipc.h>
 #include <sys/msg.h>])
+
+AC_CHECK_TYPE(cpu_set_t,
+   AC_DEFINE(HAVE_CPU_SET_T,1,[cpu_set_t is defined by the system headers]),,[
+#if HAVE_SCHED_H
+#include <sched.h>
+#endif
+])
 
 # check for compiler support of %zu printf macro
 AH_TEMPLATE(PRIuSIZE,[Compiler supports %zu printf macro])

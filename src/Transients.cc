@@ -166,6 +166,8 @@ Transients::get(const cache_key *key)
     e->mem_obj->xitTable.index = index;
     e->mem_obj->xitTable.io = Store::ioReading;
     anchor->exportInto(*e);
+    const bool collapsingRequired = EBIT_TEST(anchor->basics.flags, ENTRY_REQUIRES_COLLAPSING);
+    e->setCollapsingRequirement(collapsingRequired);
     // keep read lock to receive updates from others
     return e;
 }
@@ -187,16 +189,27 @@ Transients::findCollapsed(const sfileno index)
 }
 
 void
+Transients::clearCollapsingRequirement(const StoreEntry &e)
+{
+    assert(map);
+    assert(e.hasTransients());
+    assert(isWriter(e));
+    const auto idx = e.mem_obj->xitTable.index;
+    auto &anchor = map->writeableEntry(idx);
+    if (EBIT_TEST(anchor.basics.flags, ENTRY_REQUIRES_COLLAPSING)) {
+        EBIT_CLR(anchor.basics.flags, ENTRY_REQUIRES_COLLAPSING);
+        CollapsedForwarding::Broadcast(e);
+    }
+}
+
+void
 Transients::monitorIo(StoreEntry *e, const cache_key *key, const Store::IoStatus direction)
 {
-    assert(direction == Store::ioReading || direction == Store::ioWriting);
-
     if (!e->hasTransients()) {
         addEntry(e, key, direction);
-        e->mem_obj->xitTable.io = direction;
+        assert(e->hasTransients());
     }
 
-    assert(e->hasTransients());
     const auto index = e->mem_obj->xitTable.index;
     if (const auto old = locals->at(index)) {
         assert(old == e);
@@ -207,7 +220,7 @@ Transients::monitorIo(StoreEntry *e, const cache_key *key, const Store::IoStatus
     }
 }
 
-/// creates a new Transients entry or throws
+/// creates a new Transients entry
 void
 Transients::addEntry(StoreEntry *e, const cache_key *key, const Store::IoStatus direction)
 {
@@ -221,14 +234,20 @@ Transients::addEntry(StoreEntry *e, const cache_key *key, const Store::IoStatus 
     Ipc::StoreMapAnchor *slot = map->openForWriting(key, index);
     Must(slot); // no writer collisions
 
-    slot->set(*e, key);
+    // set ASAP in hope to unlock the slot if something throws
     e->mem_obj->xitTable.index = index;
+    e->mem_obj->xitTable.io = Store::ioWriting;
+
+    slot->set(*e, key);
     if (direction == Store::ioWriting) {
-        // keep write lock; the caller will decide what to do with it
-        map->startAppending(e->mem_obj->xitTable.index);
+        // allow reading and receive remote DELETE events, but do not switch to
+        // the reading lock because transientReaders() callers want true readers
+        map->startAppending(index);
     } else {
+        assert(direction == Store::ioReading);
         // keep the entry locked (for reading) to receive remote DELETE events
-        map->closeForWriting(e->mem_obj->xitTable.index);
+        map->switchWritingToReading(index);
+        e->mem_obj->xitTable.io = Store::ioReading;
     }
 }
 
@@ -239,15 +258,16 @@ Transients::noteFreeMapSlice(const Ipc::StoreMapSliceId)
 }
 
 void
-Transients::status(const StoreEntry &entry, bool &aborted, bool &waitingToBeFreed) const
+Transients::status(const StoreEntry &entry, Transients::EntryStatus &entryStatus) const
 {
     assert(map);
     assert(entry.hasTransients());
     const auto idx = entry.mem_obj->xitTable.index;
     const auto &anchor = isWriter(entry) ?
                          map->writeableEntry(idx) : map->readableEntry(idx);
-    aborted = anchor.writerHalted;
-    waitingToBeFreed = anchor.waitingToBeFreed;
+    entryStatus.abortedByWriter = anchor.writerHalted;
+    entryStatus.waitingToBeFreed = anchor.waitingToBeFreed;
+    entryStatus.collapsed = EBIT_TEST(anchor.basics.flags, ENTRY_REQUIRES_COLLAPSING);
 }
 
 void
@@ -255,7 +275,7 @@ Transients::completeWriting(const StoreEntry &e)
 {
     assert(e.hasTransients());
     assert(isWriter(e));
-    map->closeForWriting(e.mem_obj->xitTable.index, true);
+    map->switchWritingToReading(e.mem_obj->xitTable.index);
     e.mem_obj->xitTable.io = Store::ioReading;
 }
 

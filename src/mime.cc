@@ -46,6 +46,8 @@ public:
 
     /* StoreClient API */
     virtual void created(StoreEntry *);
+    virtual LogTags *loggingTags() { return nullptr; } // no access logging/ACLs
+    virtual void fillChecklist(ACLFilledChecklist &) const;
 
 private:
     SBuf icon_;
@@ -436,6 +438,13 @@ MimeIcon::created(StoreEntry *newEntry)
     e->timestampsSet();
     e->unlock("MimeIcon::created");
     debugs(25, 3, "Loaded icon " << url_);
+}
+
+void
+MimeIcon::fillChecklist(ACLFilledChecklist &) const
+{
+    // Unreachable: We never mayInitiateCollapsing() or startCollapsingOn().
+    assert(false);
 }
 
 MimeEntry::~MimeEntry()

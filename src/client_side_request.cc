@@ -41,6 +41,7 @@
 #include "HttpHdrCc.h"
 #include "HttpReply.h"
 #include "HttpRequest.h"
+#include "ip/NfMarkConfig.h"
 #include "ip/QosConfig.h"
 #include "ipcache.h"
 #include "log/access_log.h"
@@ -53,7 +54,6 @@
 #include "Store.h"
 #include "StrList.h"
 #include "tools.h"
-#include "URL.h"
 #include "wordlist.h"
 #if USE_AUTH
 #include "auth/UserRequest.h"
@@ -131,8 +131,7 @@ ClientRequestContext::ClientRequestContext(ClientHttpRequest *anHttp) :
     store_id_done(false),
     no_cache_done(false),
     interpreted_req_hdrs(false),
-    tosToClientDone(false),
-    nfmarkToClientDone(false),
+    toClientMarkingDone(false),
 #if USE_OPENSSL
     sslBumpCheckDone(false),
 #endif
@@ -152,7 +151,6 @@ ClientHttpRequest::ClientHttpRequest(ConnStateData * aConn) :
     uri(NULL),
     log_uri(NULL),
     req_sz(0),
-    logType(LOG_TAG_NONE),
     calloutContext(NULL),
     maxReplyBodySize_(0),
     entry_(NULL),
@@ -778,7 +776,7 @@ ClientRequestContext::clientAccessCheckDone(const allow_t &answer)
          */
         page_id = aclGetDenyInfoPage(&Config.denyInfoList, AclMatchedName, answer != ACCESS_AUTH_REQUIRED);
 
-        http->logType = LOG_TCP_DENIED;
+        http->logType.update(LOG_TCP_DENIED);
 
         if (auth_challenge) {
 #if USE_AUTH
@@ -1259,7 +1257,7 @@ ClientRequestContext::clientRedirectDone(const Helper::Reply &reply)
 
             // prevent broken helpers causing too much damage. If old URL == new URL skip the re-write.
             if (urlNote != NULL && strcmp(urlNote, http->uri)) {
-                URL tmpUrl;
+                AnyP::Uri tmpUrl;
                 if (tmpUrl.parse(old_request->method, urlNote)) {
                     HttpRequest *new_request = old_request->clone();
                     new_request->url = tmpUrl;
@@ -1385,8 +1383,8 @@ ClientRequestContext::checkNoCacheDone(const allow_t &answer)
 {
     acl_checklist = NULL;
     if (answer.denied()) {
-        http->request->flags.noCache = true; // dont read reply from cache
-        http->request->flags.cachable = false; // dont store reply into cache
+        http->request->flags.noCache = true; // do not read reply from cache
+        http->request->flags.cachable = false; // do not store reply into cache
     }
     http->doCallouts();
 }
@@ -1534,7 +1532,8 @@ void
 ClientHttpRequest::httpStart()
 {
     PROF_start(httpStart);
-    logType = LOG_TAG_NONE;
+    // XXX: Re-initializes rather than updates. Should not be needed at all.
+    logType.update(LOG_TAG_NONE);
     debugs(85, 4, logType.c_str() << " for '" << uri << "'");
 
     /* no one should have touched this */
@@ -1683,7 +1682,7 @@ ClientHttpRequest::loggingEntry(StoreEntry *newEntry)
  */
 
 tos_t aclMapTOS (acl_tos * head, ACLChecklist * ch);
-nfmark_t aclMapNfmark (acl_nfmark * head, ACLChecklist * ch);
+Ip::NfMarkConfig aclFindNfMarkConfig (acl_nfmark * head, ACLChecklist * ch);
 
 void
 ClientHttpRequest::doCallouts()
@@ -1776,27 +1775,27 @@ ClientHttpRequest::doCallouts()
         }
     } //  if !calloutContext->error
 
-    if (!calloutContext->tosToClientDone) {
-        calloutContext->tosToClientDone = true;
-        if (getConn() != NULL && Comm::IsConnOpen(getConn()->clientConnection)) {
-            ACLFilledChecklist ch(NULL, request, NULL);
-            ch.src_addr = request->client_addr;
-            ch.my_addr = request->my_addr;
+    // Set appropriate MARKs and CONNMARKs if needed.
+    if (getConn() && Comm::IsConnOpen(getConn()->clientConnection)) {
+        ACLFilledChecklist ch(nullptr, request, nullptr);
+        ch.al = calloutContext->http->al;
+        ch.src_addr = request->client_addr;
+        ch.my_addr = request->my_addr;
+        ch.syncAle(request, log_uri);
+
+        if (!calloutContext->toClientMarkingDone) {
+            calloutContext->toClientMarkingDone = true;
             tos_t tos = aclMapTOS(Ip::Qos::TheConfig.tosToClient, &ch);
             if (tos)
                 Ip::Qos::setSockTos(getConn()->clientConnection, tos);
-        }
-    }
 
-    if (!calloutContext->nfmarkToClientDone) {
-        calloutContext->nfmarkToClientDone = true;
-        if (getConn() != NULL && Comm::IsConnOpen(getConn()->clientConnection)) {
-            ACLFilledChecklist ch(NULL, request, NULL);
-            ch.src_addr = request->client_addr;
-            ch.my_addr = request->my_addr;
-            nfmark_t mark = aclMapNfmark(Ip::Qos::TheConfig.nfmarkToClient, &ch);
-            if (mark)
-                Ip::Qos::setSockNfmark(getConn()->clientConnection, mark);
+            const auto packetMark = aclFindNfMarkConfig(Ip::Qos::TheConfig.nfmarkToClient, &ch);
+            if (!packetMark.isEmpty())
+                Ip::Qos::setSockNfmark(getConn()->clientConnection, packetMark.mark);
+
+            const auto connmark = aclFindNfMarkConfig(Ip::Qos::TheConfig.nfConnmarkToClient, &ch);
+            if (!connmark.isEmpty())
+                Ip::Qos::setNfConnmark(getConn()->clientConnection, Ip::Qos::dirAccepted, connmark);
         }
     }
 
@@ -1941,7 +1940,6 @@ ClientHttpRequest::handleAdaptedHeader(Http::Message *msg)
         assert(repContext);
         repContext->createStoreEntry(request->method, request->flags);
 
-        EBIT_CLR(storeEntry()->flags, ENTRY_FWD_HDR_WAIT);
         request_satisfaction_mode = true;
         request_satisfaction_offset = 0;
         storeEntry()->replaceHttpReply(new_rep);
